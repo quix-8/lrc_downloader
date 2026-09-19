@@ -58,11 +58,9 @@ pub fn get_api_key() -> Result<String, Box<dyn Error>> {
         }
     }
 
-    // Если ни один из вариантов не сработал, отдаем понятную ошибку
     Err("API not found in api.txt and in dotfiles direcrtory".into())
 }
 
-// Вызывать после завершения основного цикла скачивания
 async fn trigger_jellyfin_scan(client: &Client, base_url: &str) -> Result<(), Box<dyn Error>> {
     let jellyfin_url = format!("{}/Library/Refresh", base_url.trim_end_matches('/'));
     let key = get_api_key()?;
@@ -88,6 +86,7 @@ async fn trigger_jellyfin_scan(client: &Client, base_url: &str) -> Result<(), Bo
 async fn ask_lrclib(
     client: &Client,
     tag: (PathBuf, String, String, String, u64),
+    marker: &mut bool,
 ) -> Result<Option<String>, reqwest::Error> {
     let url = "https://lrclib.net/api/get";
 
@@ -96,9 +95,6 @@ async fn ask_lrclib(
     let album_name = tag.3;
     let duration_str = tag.4.to_string();
 
-    // album_name и duration сужают поиск: если альбом пустой или duration
-    // не совпадает с тем, что в базе LRCLIB, /api/get вернет 404.
-    // Передаем их только когда они реально есть.
     let mut params = vec![("track_name", track_name), ("artist_name", artist_name)];
     if !album_name.is_empty() {
         params.push(("album_name", album_name));
@@ -114,31 +110,38 @@ async fn ask_lrclib(
         .send()
         .await?;
 
-    // 404 = трек не найден, это штатный ответ, а не ошибка
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
 
     let response = response.error_for_status()?;
     let track_info = response.json::<Track>().await?;
+    if track_info.synced_lyrics.is_some() {
+        *marker = true;
+    }
 
-    // Синхронизированные тексты приоритетнее обычных
     Ok(track_info.synced_lyrics.or(track_info.plain_lyrics))
 }
 
-async fn save_lrc(lyrics_to_save: Option<String>, path: PathBuf) {
+async fn save_lrc(
+    lyrics_to_save: Option<String>,
+    path: PathBuf,
+    is_synced: bool,
+    artist: String,
+    track: String,
+) {
     if let Some(text) = lyrics_to_save {
         let lrc_path = path.with_extension("lrc");
 
         match fs::write(&lrc_path, text).await {
             Ok(_) => {
-                // let tag = if is_synced { "[+ SYNC]" } else { "[+ PLAIN]" };
-                println!("Saved LRC");
+                let tag = if is_synced { "[+ SYNC]" } else { "[+ PLAIN]" };
+                println!("{} Saved LRC {} - {}", tag, artist, track);
             }
             Err(e) => eprintln!("[-] Error while writing {:?}: {}", lrc_path, e),
         }
     } else {
-        println!("[!] No LRC for");
+        println!("[!] No LRC for {} - {}", artist, track);
     }
 }
 #[tokio::main]
@@ -221,10 +224,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let path = tag.0.clone();
             let track_name = tag.1.clone();
             let artist_name = tag.2.clone();
+            let mut is_synced = false;
 
-            match ask_lrclib(&client, tag).await {
+            match ask_lrclib(&client, tag, &mut is_synced).await {
                 Ok(lyrics) => {
-                    save_lrc(lyrics, path).await;
+                    save_lrc(lyrics, path, is_synced, artist_name, track_name).await;
                 }
                 Err(e) => {
                     eprintln!(
@@ -236,9 +240,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             sleep(Duration::from_millis(150)).await;
         });
     }
-
-    // Дожидаемся завершения всех тасок. Без этого main завершится раньше,
-    // рантайм прибьет незавершенные запросы, а Jellyfin отсканирует пусто.
     while let Some(res) = set.join_next().await {
         if let Err(e) = res {
             eprintln!("[+] Task panicked: {:?}", e);

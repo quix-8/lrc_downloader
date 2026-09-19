@@ -7,6 +7,7 @@ use lofty::tag::Accessor;
 use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -144,6 +145,40 @@ async fn save_lrc(
         println!("[!] No LRC for {} - {}", artist, track);
     }
 }
+
+async fn get_music(path: PathBuf) -> Vec<PathBuf> {
+    tokio::task::spawn_blocking(move || {
+        let mut data: Vec<PathBuf> = Vec::new();
+
+        for entry in WalkDir::new(path) {
+            match entry {
+                Ok(e) => {
+                    let path = e.into_path();
+                    if path.is_file() {
+                        let is_audio = path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext_str| {
+                                let lower = ext_str.to_lowercase();
+                                matches!(lower.as_str(), "flac" | "mp3" | "m4a" | "ogg" | "wav")
+                            })
+                            .unwrap_or(false);
+
+                        if is_audio {
+                            data.push(path);
+                        }
+                    }
+                }
+                Err(err) => eprintln!("Ignored cause of error: {}", err),
+            }
+        }
+
+        data
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -151,29 +186,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let semaphore = Arc::new(Semaphore::new(4));
     let mut set = JoinSet::new();
 
-    let mut data: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(&args.path) {
-        match entry {
-            Ok(e) => {
-                let path = e.into_path();
-                if path.is_file() {
-                    let is_audio = path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext_str| {
-                            let lower = ext_str.to_lowercase();
-                            matches!(lower.as_str(), "flac" | "mp3" | "m4a" | "ogg" | "wav")
-                        })
-                        .unwrap_or(false);
-
-                    if is_audio {
-                        data.push(path);
-                    }
-                }
-            }
-            Err(err) => eprintln!("Ignored cause of error: {}", err),
-        }
-    }
+    let data: Vec<PathBuf> = get_music(args.path).await;
 
     let mut apis: Vec<(PathBuf, String, String, String, u64)> = Vec::new();
 
